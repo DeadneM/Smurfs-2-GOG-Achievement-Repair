@@ -1,0 +1,103 @@
+name: Build and publish v1.0.0
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct validated source
+        shell: bash
+        run: |
+          cat release-seed/source_seed.b64.part* > source_seed.b64
+          base64 -d source_seed.b64 > source_seed.zip
+          mkdir -p extracted
+          unzip -q source_seed.zip -d extracted
+          cp extracted/Smurfs2_GOG_Achievement_Repair.go ./Smurfs2_GOG_Achievement_Repair.go
+          test -f README.md
+
+      - name: Setup Go 1.23.2
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.2"
+
+      - name: Build exact validated Windows x64 executable
+        shell: bash
+        run: |
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0             go build -trimpath -ldflags="-s -w"             -o Smurfs2_GOG_Achievement_Repair.exe             Smurfs2_GOG_Achievement_Repair.go
+          echo "Expected validated EXE SHA-256:"
+          echo "e08896b9f7e11f262cf224e14efe0794e1fcee90cb95cd8dd8e04a53ca6193d5"
+          echo "Built EXE SHA-256:"
+          sha256sum Smurfs2_GOG_Achievement_Repair.exe
+          test "$(sha256sum Smurfs2_GOG_Achievement_Repair.exe | cut -d' ' -f1)" = "e08896b9f7e11f262cf224e14efe0794e1fcee90cb95cd8dd8e04a53ca6193d5"
+
+      - name: Publish source to repository
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Smurfs2_GOG_Achievement_Repair.go
+          git rm -r release-seed
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish validated v1.0.0 source [skip ci]"
+            git push origin HEAD:main
+          fi
+
+      - name: Build release archives
+        shell: bash
+        run: |
+          rm -rf dist
+          mkdir -p dist/windows dist/script
+
+          cp Smurfs2_GOG_Achievement_Repair.exe README.md dist/windows/
+          cp Smurfs2_GOG_Achievement_Repair.go README.md dist/script/
+
+          (
+            cd dist/windows
+            zip -9 ../Smurfs2_GOG_Achievement_Repair_v1.0.0_Windows_x64.zip               Smurfs2_GOG_Achievement_Repair.exe README.md
+          )
+          (
+            cd dist/script
+            zip -9 ../Smurfs2_GOG_Achievement_Repair_v1.0.0_Script.zip               Smurfs2_GOG_Achievement_Repair.go README.md
+          )
+
+          test "$(zipinfo -1 dist/Smurfs2_GOG_Achievement_Repair_v1.0.0_Windows_x64.zip | wc -l)" -eq 2
+          test "$(zipinfo -1 dist/Smurfs2_GOG_Achievement_Repair_v1.0.0_Script.zip | wc -l)" -eq 2
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          cat > release-notes.md <<'EOF'
+          First public release of **The Smurfs 2: The Prisoner of the Green Stone - GOG Achievement Repair**.
+
+          - Audits local `flow.sav` progression without modifying it.
+          - Repairs missing `VERIFIED` achievements only when the save proves their requirements.
+          - Offers manual repair for `INFO` achievements that cannot be proven from persistent save data, with an explicit anti-cheat warning.
+          - Never offers `NOT MET` achievements through the manual INFO menu.
+          - Verifies every successful write by re-reading the live GOG account.
+          - Repairs `Smurfinator` only after all other GOG achievements are unlocked.
+
+          The Windows archive contains only the executable and README.
+          The Script archive contains only the Go source and README.
+          EOF
+
+          if gh release view v1.0.0 >/dev/null 2>&1; then
+            gh release upload v1.0.0               dist/Smurfs2_GOG_Achievement_Repair_v1.0.0_Windows_x64.zip               dist/Smurfs2_GOG_Achievement_Repair_v1.0.0_Script.zip               --clobber
+          else
+            gh release create v1.0.0               --target main               --title "Smurfs 2 GOG Achievement Repair v1.0.0"               --notes-file release-notes.md               dist/Smurfs2_GOG_Achievement_Repair_v1.0.0_Windows_x64.zip               dist/Smurfs2_GOG_Achievement_Repair_v1.0.0_Script.zip
+          fi
