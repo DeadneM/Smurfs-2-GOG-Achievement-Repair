@@ -1,3 +1,5 @@
+![Smurfs 2 GOG Achievement Repair](docs/images/banner.png)
+
 # The Smurfs 2: The Prisoner of the Green Stone - GOG Achievement Repair
 
 Repairs GOG Galaxy achievements that should already be unlocked according to your local `flow.sav` progression.
