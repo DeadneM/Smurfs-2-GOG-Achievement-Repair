@@ -100,7 +100,9 @@ Smurfs2_GOG_Achievement_Repair.exe --set-difficulty 1 challenge
 
 ## Release packages
 
-The v1.1.2 release provides two clean archives:
+Download **v1.1.2** from the [GitHub release](https://github.com/DeadneM/Smurfs-2-GOG-Achievement-Repair/releases/tag/v1.1.2).
+
+The release provides two clean archives:
 
 - `Smurfs2_GOG_Achievement_Repair_v1.1.2_Windows_x64.zip` - EXE + README
 - `Smurfs2_GOG_Achievement_Repair_v1.1.2_Script.zip` - Go script + README
