@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	toolVersion      = "1.0.0"
+	toolVersion      = "1.1.2"
 	productID        = "1906012961"
 	expectedClientID = "56511167488088821"
 	fallbackBuildID  = "56997659418857909"
@@ -705,6 +705,480 @@ func modelSlots(raw [][]property) ([]slotData, error) {
 	return out, nil
 }
 
+// ---------------- Save difficulty helper ----------------
+
+type gameDifficultyChoice struct {
+	MenuName string
+	EnumName string
+	Help     string
+}
+
+var supportedGameDifficulties = []gameDifficultyChoice{
+	{
+		MenuName: "Story",
+		EnumName: "EGameDifficulty::EASY",
+		Help:     "easiest public difficulty",
+	},
+	{
+		MenuName: "Epic",
+		EnumName: "EGameDifficulty::MEDIUM",
+		Help:     "normal public difficulty",
+	},
+	{
+		MenuName: "Challenge",
+		EnumName: "EGameDifficulty::HARD",
+		Help:     "hard public difficulty; required for 'And his name is Zosimos...'",
+	},
+}
+
+func difficultyByNumber(n int) (gameDifficultyChoice, bool) {
+	if n < 1 || n > len(supportedGameDifficulties) {
+		return gameDifficultyChoice{}, false
+	}
+	return supportedGameDifficulties[n-1], true
+}
+
+func difficultyByName(s string) (gameDifficultyChoice, bool) {
+	n := strings.ToLower(strings.TrimSpace(s))
+	for _, d := range supportedGameDifficulties {
+		if strings.ToLower(d.MenuName) == n || strings.ToLower(d.EnumName) == n {
+			return d, true
+		}
+	}
+	return gameDifficultyChoice{}, false
+}
+
+func friendlyDifficulty(enumName string) string {
+	for _, d := range supportedGameDifficulties {
+		if d.EnumName == enumName {
+			return fmt.Sprintf("%s (%s)", d.MenuName, d.EnumName)
+		}
+	}
+	if enumName == "EGameDifficulty::HARD_PLUS" {
+		return "HARD_PLUS (internal/undocumented; not exposed by this tool)"
+	}
+	if enumName == "" {
+		return "(unknown)"
+	}
+	return enumName
+}
+
+type saveTagMeta struct {
+	Name       string
+	Type       string
+	Size       int32
+	SizePos    int
+	ValueStart int
+	ValueEnd   int
+	BoolTag    bool
+}
+
+type difficultySlotPatch struct {
+	Slot       int
+	Used       bool
+	Difficulty string
+	SizePos    int
+	ValueStart int
+	ValueEnd   int
+}
+
+type difficultyLayout struct {
+	RootSizePos  int
+	InnerSizePos int
+	Slots        []difficultySlotPatch
+}
+
+func readTagMeta(r *gvasReader) (saveTagMeta, bool, error) {
+	var m saveTagMeta
+	name, err := r.fstr()
+	if err != nil {
+		return m, false, err
+	}
+	m.Name = name
+	if name == "None" {
+		return m, true, nil
+	}
+	typ, err := r.fstr()
+	if err != nil {
+		return m, false, err
+	}
+	m.Type = typ
+	m.SizePos = r.o
+	sz, err := r.i32()
+	if err != nil {
+		return m, false, err
+	}
+	if sz < 0 || sz > int32(len(r.b)) {
+		return m, false, fmt.Errorf("invalid property size %d for %s", sz, name)
+	}
+	m.Size = sz
+	if _, err = r.i32(); err != nil {
+		return m, false, err
+	}
+
+	switch typ {
+	case "StructProperty":
+		if _, err = r.fstr(); err != nil {
+			return m, false, err
+		}
+		if _, err = r.raw(16); err != nil {
+			return m, false, err
+		}
+	case "BoolProperty":
+		v, e := r.u8()
+		if e != nil {
+			return m, false, e
+		}
+		m.BoolTag = v != 0
+	case "ByteProperty", "EnumProperty":
+		if _, err = r.fstr(); err != nil {
+			return m, false, err
+		}
+	case "ArrayProperty", "SetProperty":
+		if _, err = r.fstr(); err != nil {
+			return m, false, err
+		}
+	case "MapProperty":
+		if _, err = r.fstr(); err != nil {
+			return m, false, err
+		}
+		if _, err = r.fstr(); err != nil {
+			return m, false, err
+		}
+	}
+	hasGuid, err := r.u8()
+	if err != nil {
+		return m, false, err
+	}
+	if hasGuid != 0 {
+		if _, err = r.raw(16); err != nil {
+			return m, false, err
+		}
+	}
+	m.ValueStart = r.o
+	m.ValueEnd = r.o + int(m.Size)
+	if m.ValueEnd < m.ValueStart || m.ValueEnd > len(r.b) {
+		return m, false, fmt.Errorf("invalid value span for %s", name)
+	}
+	return m, false, nil
+}
+
+func locateDifficultyLayout(b []byte) (difficultyLayout, error) {
+	var out difficultyLayout
+	if len(b) < 16 || string(b[:4]) != "GVAS" {
+		return out, errors.New("not an Unreal Engine GVAS save")
+	}
+	classBytes := []byte("/Script/SM2.SM2SaveGameFlow\x00")
+	pos := bytes.Index(b, classBytes)
+	if pos < 4 {
+		return out, errors.New("SM2 save class not found")
+	}
+	r := &gvasReader{b: b, o: pos - 4}
+	cls, err := r.fstr()
+	if err != nil {
+		return out, err
+	}
+	if cls != "/Script/SM2.SM2SaveGameFlow" {
+		return out, fmt.Errorf("unexpected save class %q", cls)
+	}
+
+	var root saveTagMeta
+	for {
+		m, finished, e := readTagMeta(r)
+		if e != nil {
+			return out, e
+		}
+		if finished {
+			return out, errors.New("FlowSaveSlots not found")
+		}
+		if m.Name == "FlowSaveSlots" {
+			root = m
+			break
+		}
+		r.o = m.ValueEnd
+	}
+	if root.Type != "ArrayProperty" {
+		return out, fmt.Errorf("FlowSaveSlots is %s, expected ArrayProperty", root.Type)
+	}
+	out.RootSizePos = root.SizePos
+
+	r.o = root.ValueStart
+	count32, err := r.i32()
+	if err != nil {
+		return out, err
+	}
+	if count32 <= 0 || count32 > 16 {
+		return out, fmt.Errorf("unexpected save slot count %d", count32)
+	}
+
+	inner, finished, err := readTagMeta(r)
+	if err != nil {
+		return out, err
+	}
+	if finished || inner.Type != "StructProperty" {
+		return out, errors.New("FlowSaveSlots inner struct descriptor missing")
+	}
+	if inner.ValueEnd != root.ValueEnd {
+		return out, fmt.Errorf("FlowSaveSlots inner span mismatch 0x%X != 0x%X", inner.ValueEnd, root.ValueEnd)
+	}
+	out.InnerSizePos = inner.SizePos
+
+	for slot := 1; slot <= int(count32); slot++ {
+		d := difficultySlotPatch{Slot: slot}
+		foundDifficulty := false
+		for {
+			m, itemEnd, e := readTagMeta(r)
+			if e != nil {
+				return out, fmt.Errorf("slot %d: %w", slot, e)
+			}
+			if itemEnd {
+				break
+			}
+			if m.Name == "bIsSlotUsed" && m.Type == "BoolProperty" {
+				d.Used = m.BoolTag
+			}
+			if m.Name == "CurrentDifficulty" && m.Type == "EnumProperty" {
+				vr := &gvasReader{b: b, o: m.ValueStart}
+				v, e := vr.fstr()
+				if e != nil || vr.o != m.ValueEnd {
+					return out, fmt.Errorf("slot %d CurrentDifficulty has unexpected encoding", slot)
+				}
+				d.Difficulty = v
+				d.SizePos = m.SizePos
+				d.ValueStart = m.ValueStart
+				d.ValueEnd = m.ValueEnd
+				foundDifficulty = true
+			}
+			r.o = m.ValueEnd
+		}
+		if !foundDifficulty {
+			return out, fmt.Errorf("slot %d CurrentDifficulty not found", slot)
+		}
+		out.Slots = append(out.Slots, d)
+	}
+	if r.o != root.ValueEnd {
+		return out, fmt.Errorf("slot stream ended at 0x%X, expected 0x%X", r.o, root.ValueEnd)
+	}
+	return out, nil
+}
+
+func encodeAnsiFString(s string) []byte {
+	v := append([]byte(s), 0)
+	out := make([]byte, 4+len(v))
+	binary.LittleEndian.PutUint32(out[:4], uint32(len(v)))
+	copy(out[4:], v)
+	return out
+}
+
+func patchDifficultyBytes(b []byte, slotNumber int, target gameDifficultyChoice) ([]byte, string, error) {
+	layout, err := locateDifficultyLayout(b)
+	if err != nil {
+		return nil, "", err
+	}
+	if slotNumber < 1 || slotNumber > len(layout.Slots) {
+		return nil, "", fmt.Errorf("slot %d does not exist", slotNumber)
+	}
+	slot := layout.Slots[slotNumber-1]
+	if !slot.Used {
+		return nil, "", fmt.Errorf("slot %d is unused; refusing to modify it", slotNumber)
+	}
+	if slot.Difficulty == target.EnumName {
+		return append([]byte(nil), b...), slot.Difficulty, nil
+	}
+	if !strings.HasPrefix(slot.Difficulty, "EGameDifficulty::") {
+		return nil, "", fmt.Errorf("slot %d has unexpected difficulty %q", slotNumber, slot.Difficulty)
+	}
+
+	newValue := encodeAnsiFString(target.EnumName)
+	oldSerialized := slot.ValueEnd - slot.ValueStart
+	delta := len(newValue) - oldSerialized
+	patched := append([]byte(nil), b...)
+
+	rootSize := int32(binary.LittleEndian.Uint32(patched[layout.RootSizePos : layout.RootSizePos+4]))
+	innerSize := int32(binary.LittleEndian.Uint32(patched[layout.InnerSizePos : layout.InnerSizePos+4]))
+	propSize := int32(binary.LittleEndian.Uint32(patched[slot.SizePos : slot.SizePos+4]))
+	if rootSize+int32(delta) <= 0 || innerSize+int32(delta) <= 0 || propSize+int32(delta) <= 0 {
+		return nil, "", errors.New("difficulty patch would produce invalid property sizes")
+	}
+	binary.LittleEndian.PutUint32(patched[layout.RootSizePos:layout.RootSizePos+4], uint32(rootSize+int32(delta)))
+	binary.LittleEndian.PutUint32(patched[layout.InnerSizePos:layout.InnerSizePos+4], uint32(innerSize+int32(delta)))
+	binary.LittleEndian.PutUint32(patched[slot.SizePos:slot.SizePos+4], uint32(propSize+int32(delta)))
+
+	out := make([]byte, 0, len(patched)+delta)
+	out = append(out, patched[:slot.ValueStart]...)
+	out = append(out, newValue...)
+	out = append(out, patched[slot.ValueEnd:]...)
+	return out, slot.Difficulty, nil
+}
+
+func uniqueBackupPath(savePath string) string {
+	base := savePath + ".Backup"
+	if _, err := os.Stat(base); os.IsNotExist(err) {
+		return base
+	}
+	stamp := time.Now().Format("20060102_150405")
+	return savePath + ".Backup_" + stamp
+}
+
+func setGameDifficulty(savePath string, slotNumber int, target gameDifficultyChoice) error {
+	original, err := os.ReadFile(savePath)
+	if err != nil {
+		return err
+	}
+	beforeSlots, beforeHash, err := parseFlowSave(savePath)
+	if err != nil {
+		return fmt.Errorf("pre-patch save validation failed: %w", err)
+	}
+	beforeModel, err := modelSlots(beforeSlots)
+	if err != nil {
+		return err
+	}
+	if slotNumber < 1 || slotNumber > len(beforeModel) || !beforeModel[slotNumber-1].Used {
+		return fmt.Errorf("slot %d is not a used save slot", slotNumber)
+	}
+
+	patched, oldDifficulty, err := patchDifficultyBytes(original, slotNumber, target)
+	if err != nil {
+		return err
+	}
+	if oldDifficulty == target.EnumName {
+		fmt.Printf("[OK] Slot %d is already set to %s.\n", slotNumber, friendlyDifficulty(target.EnumName))
+		return nil
+	}
+
+	tmp := savePath + ".difficulty.tmp"
+	if err := os.WriteFile(tmp, patched, 0644); err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+
+	checkSlots, _, err := parseFlowSave(tmp)
+	if err != nil {
+		return fmt.Errorf("patched save failed structural validation: %w", err)
+	}
+	checkModel, err := modelSlots(checkSlots)
+	if err != nil {
+		return fmt.Errorf("patched save failed model validation: %w", err)
+	}
+	if slotNumber > len(checkModel) || checkModel[slotNumber-1].CurrentDifficulty != target.EnumName {
+		return fmt.Errorf("patched save did not verify as %s", target.EnumName)
+	}
+
+	backup := uniqueBackupPath(savePath)
+	if err := os.WriteFile(backup, original, 0644); err != nil {
+		return fmt.Errorf("backup creation failed: %w", err)
+	}
+	if err := os.WriteFile(savePath, patched, 0644); err != nil {
+		_ = os.WriteFile(savePath, original, 0644)
+		return fmt.Errorf("save write failed; original was restored: %w", err)
+	}
+
+	afterSlots, afterHash, err := parseFlowSave(savePath)
+	if err != nil {
+		_ = os.WriteFile(savePath, original, 0644)
+		return fmt.Errorf("post-write validation failed; original was restored: %w", err)
+	}
+	afterModel, err := modelSlots(afterSlots)
+	if err != nil || slotNumber > len(afterModel) || afterModel[slotNumber-1].CurrentDifficulty != target.EnumName {
+		_ = os.WriteFile(savePath, original, 0644)
+		return errors.New("post-write difficulty verification failed; original was restored")
+	}
+
+	fmt.Printf("[OK] Backup: %s\n", backup)
+	fmt.Printf("[OK] Slot %d difficulty: %s -> %s\n",
+		slotNumber, friendlyDifficulty(oldDifficulty), friendlyDifficulty(target.EnumName))
+	fmt.Printf("[OK] Save SHA-256: %s -> %s\n", beforeHash, afterHash)
+	fmt.Println("[OK] Patched save reparsed successfully after writing.")
+	if target.MenuName == "Challenge" {
+		fmt.Println("[INFO] Challenge is the difficulty required for 'And his name is Zosimos...'.")
+		fmt.Println("[INFO] For the Stolas achievement, use Challenge for the STORY encounter with Stolas.")
+		fmt.Println("[INFO] Later optional replay/challenge versions of the boss may not trigger the achievement reliably.")
+		fmt.Println("[INFO] After changing difficulty, load the save once. If a level hangs, restart the game and load it again.")
+		fmt.Println("[INFO] After the fight, you can run this helper again and switch the slot back to Story or Epic.")
+	}
+	return nil
+}
+
+func difficultyHelper(savePath string) error {
+	raw, _, err := parseFlowSave(savePath)
+	if err != nil {
+		return err
+	}
+	slots, err := modelSlots(raw)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("\n====================== SAVE DIFFICULTY HELPER ======================")
+	fmt.Println("This OPTIONAL feature modifies flow.sav. A full backup is created first.")
+	fmt.Println("It changes only CurrentDifficulty in the selected USED save slot.")
+	fmt.Println()
+	fmt.Println("Public game difficulties:")
+	fmt.Println("  1) Story     = EGameDifficulty::EASY")
+	fmt.Println("  2) Epic      = EGameDifficulty::MEDIUM")
+	fmt.Println("  3) Challenge = EGameDifficulty::HARD")
+	fmt.Println()
+	fmt.Println("Achievement note:")
+	fmt.Println("  'And his name is Zosimos...' requires defeating Stolas on Challenge.")
+	fmt.Println("  Use Challenge for the STORY encounter with Stolas; later optional replays may not trigger it reliably.")
+	fmt.Println("  After editing difficulty, load the save once; if a level hangs, restart the game and load it again.")
+	fmt.Println("  After defeating Stolas, the difficulty can be changed back at any time.")
+	fmt.Println("  EGameDifficulty::HARD_PLUS exists internally but is undocumented and is NOT exposed.")
+	fmt.Println("-------------------------------------------------------------------------")
+
+	for _, s := range slots {
+		state := "unused"
+		if s.Used {
+			state = friendlyDifficulty(s.CurrentDifficulty)
+		}
+		fmt.Printf("  Slot %d: %s\n", s.Number, state)
+	}
+
+	fmt.Print("Select a USED slot number, or press Enter to cancel: ")
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	line = strings.TrimSpace(line)
+	if line == "" {
+		fmt.Println("Difficulty helper cancelled.")
+		return nil
+	}
+	slotNumber, err := strconv.Atoi(line)
+	if err != nil || slotNumber < 1 || slotNumber > len(slots) || !slots[slotNumber-1].Used {
+		return errors.New("invalid or unused slot selection")
+	}
+
+	fmt.Println()
+	for i, d := range supportedGameDifficulties {
+		suffix := ""
+		if d.MenuName == "Challenge" {
+			suffix = "  <-- required for the Stolas difficulty achievement"
+		}
+		fmt.Printf("  %d) %-9s %s%s\n", i+1, d.MenuName, d.Help, suffix)
+	}
+	fmt.Print("Choose the new difficulty, or press Enter to cancel: ")
+	diffLine, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	diffLine = strings.TrimSpace(diffLine)
+	if diffLine == "" {
+		fmt.Println("Difficulty helper cancelled.")
+		return nil
+	}
+	diffNumber, err := strconv.Atoi(diffLine)
+	if err != nil {
+		return errors.New("invalid difficulty selection")
+	}
+	target, ok := difficultyByNumber(diffNumber)
+	if !ok {
+		return errors.New("invalid difficulty selection")
+	}
+
+	fmt.Printf("Slot %d will be changed to %s. Type APPLY to continue: ", slotNumber, friendlyDifficulty(target.EnumName))
+	confirm, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	if strings.TrimSpace(confirm) != "APPLY" {
+		fmt.Println("Difficulty helper cancelled. Nothing was changed.")
+		return nil
+	}
+	return setGameDifficulty(savePath, slotNumber, target)
+}
+
 // ---------------- Achievement rules ----------------
 
 type evalStatus int
@@ -1057,7 +1531,7 @@ func registryRefreshToken() (string, error) {
 func fetchBuildDetails() (buildDetails, string, error) {
 	var pd productData
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://www.gogdb.org/data/products/%s.json", productID), nil)
-	req.Header.Set("User-Agent", "Smurfs2-GOG-Achievement-Repair/3.0")
+	req.Header.Set("User-Agent", "Smurfs2-GOG-Achievement-Repair/1.1.0")
 	resp, err := httpClient.Do(req)
 	if err == nil {
 		defer resp.Body.Close()
@@ -1078,7 +1552,7 @@ func fetchBuildDetails() (buildDetails, string, error) {
 	var d buildDetails
 	u := fmt.Sprintf("https://www.gogdb.org/data/products/%s/builds/%s.json", productID, buildID)
 	req, _ = http.NewRequest("GET", u, nil)
-	req.Header.Set("User-Agent", "Smurfs2-GOG-Achievement-Repair/3.0")
+	req.Header.Set("User-Agent", "Smurfs2-GOG-Achievement-Repair/1.1.0")
 	resp, err = httpClient.Do(req)
 	if err != nil {
 		return d, buildID, err
@@ -1102,7 +1576,7 @@ func authenticate(refreshToken, clientID, clientSecret string) (authResponse, er
 	q.Set("client_secret", clientSecret)
 	q.Set("without_new_session", "1")
 	req, _ := http.NewRequest("GET", "https://auth.gog.com/token?"+q.Encode(), nil)
-	req.Header.Set("User-Agent", "Smurfs2-GOG-Achievement-Repair/3.0")
+	req.Header.Set("User-Agent", "Smurfs2-GOG-Achievement-Repair/1.1.0")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return a, err
@@ -1127,7 +1601,7 @@ func getAchievements(clientID, userID, accessToken string) ([]achievement, error
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Gog-Lc", "en")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("User-Agent", "Smurfs2-GOG-Achievement-Repair/3.0")
+	req.Header.Set("User-Agent", "Smurfs2-GOG-Achievement-Repair/1.1.0")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -1164,7 +1638,7 @@ func unlockAchievement(clientID, userID, achievementID, accessToken string) (int
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("User-Agent", "Smurfs2-GOG-Achievement-Repair/3.0")
+	req.Header.Set("User-Agent", "Smurfs2-GOG-Achievement-Repair/1.1.0")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return 0, err
@@ -1355,23 +1829,33 @@ func main() {
 	defer closeLog()
 	fmt.Println("=================================================================")
 	fmt.Printf("The Smurfs 2 - GOG Achievement Repair v%s\n", toolVersion)
-	fmt.Println("Universal save-aware repair + explicit manual INFO mode")
+	fmt.Println("Achievement repair + optional per-slot save difficulty helper")
 	fmt.Println("=================================================================")
 	fmt.Println()
 
-	if len(os.Args) >= 2 && os.Args[1] == "--offline-audit" {
-		path := ""
-		if len(os.Args) >= 3 {
-			path = os.Args[2]
+	if len(os.Args) >= 2 && os.Args[1] == "--set-difficulty" {
+		if len(os.Args) < 4 {
+			fatal(errors.New("usage: --set-difficulty <slot> <story|epic|challenge> [flow.sav]"))
+		}
+		slotNumber, e := strconv.Atoi(os.Args[2])
+		if e != nil || slotNumber < 1 {
+			fatal(errors.New("invalid slot number"))
+		}
+		target, ok := difficultyByName(os.Args[3])
+		if !ok {
+			fatal(errors.New("difficulty must be story, epic, or challenge"))
+		}
+		savePath := ""
+		if len(os.Args) >= 5 {
+			savePath = os.Args[4]
 		} else {
-			var e error
-			path, e = findSave()
+			savePath, e = findSave()
 			if e != nil {
 				fatal(e)
 			}
 		}
-		if err := offlineAudit(path); err != nil {
-			fatal(err)
+		if e := setGameDifficulty(savePath, slotNumber, target); e != nil {
+			fatal(e)
 		}
 		pause()
 		return
@@ -1381,6 +1865,27 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	fmt.Println("Choose an action:")
+	fmt.Println("  1) Audit / repair GOG achievements")
+	fmt.Println("  2) Save helper: change difficulty per slot (Story / Epic / Challenge)")
+	fmt.Println("  Q) Quit")
+	fmt.Print("Choice [1]: ")
+	choice, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	choice = strings.TrimSpace(strings.ToUpper(choice))
+	if choice == "Q" {
+		return
+	}
+	if choice == "2" {
+		if e := difficultyHelper(savePath); e != nil {
+			fatal(e)
+		}
+		pause()
+		return
+	}
+	if choice != "" && choice != "1" {
+		fatal(errors.New("invalid menu choice"))
+	}
+
 	rawSlots, hash, err := parseFlowSave(savePath)
 	if err != nil {
 		fatal(fmt.Errorf("save parse failed: %w", err))
@@ -1493,9 +1998,9 @@ func main() {
 		}
 		fmt.Println(".")
 		fmt.Println("No local save file will be modified.")
-		fmt.Print("Type REPARER then Enter to unlock only VERIFIED achievements (or press Enter to skip): ")
+		fmt.Print("Type REPAIR then Enter to unlock only VERIFIED achievements (or press Enter to skip): ")
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-		if strings.TrimSpace(line) == "REPARER" {
+		if strings.EqualFold(strings.TrimSpace(line), "REPAIR") {
 			productAuth, err := authenticate(refreshToken, details.ClientID, details.ClientSecret)
 			if err != nil {
 				fatal(fmt.Errorf("game-scoped GOG authentication failed: %w", err))
@@ -1558,7 +2063,6 @@ func main() {
 		fmt.Println("\n====================== MANUAL INFO MODE ======================")
 		fmt.Println("INFO means the condition cannot be reliably proven from flow.sav.")
 		fmt.Println("You may manually repair it ONLY if you genuinely earned it in-game.")
-		fmt.Println("Schtroumpfer un succes que vous n'avez pas reellement obtenu, c'est de la triche.")
 		fmt.Println("Unlocking an achievement you did not actually earn is cheating.")
 		fmt.Println("NOT MET achievements are deliberately NOT offered here.")
 		fmt.Println("--------------------------------------------------------------")
@@ -1582,13 +2086,13 @@ func main() {
 			if !valid {
 				fmt.Println("[WARN] Invalid selection. Manual mode cancelled.")
 			} else {
-				fmt.Println("\nWARNING / AVERTISSEMENT")
+				fmt.Println("\nWARNING")
 				fmt.Println("These INFO achievements cannot be verified from the save.")
 				fmt.Println("By continuing, you confirm that YOU actually fulfilled every selected condition in-game.")
-				fmt.Println("Tapez JE LES AI OBTENUS (or I EARNED THESE) to confirm: ")
+				fmt.Print("Type I EARNED THESE to confirm: ")
 				confirm, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 				c := strings.TrimSpace(confirm)
-				if c != "JE LES AI OBTENUS" && c != "I EARNED THESE" {
+				if c != "I EARNED THESE" {
 					fmt.Println("Manual unlock cancelled. Nothing manual was changed.")
 				} else {
 					productAuth, err := authenticate(refreshToken, details.ClientID, details.ClientSecret)
@@ -1655,7 +2159,7 @@ func main() {
 		}
 	}
 
-	fmt.Println("\nDone. flow.sav was never modified.")
+	fmt.Println("\nDone. Achievement repair mode did not modify flow.sav.")
 	fmt.Println("Only [OK] lines with a confirmed date are considered successful.")
 	fmt.Println("Refresh the game's Achievements page in GOG Galaxy. If the UI is stale, restart Galaxy.")
 	pause()
