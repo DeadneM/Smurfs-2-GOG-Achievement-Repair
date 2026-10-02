@@ -1,0 +1,107 @@
+name: Build Smurfs v1.1.2 release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.event.head_commit.message == 'Build Smurfs v1.1.2 release'
+    runs-on: ubuntu-latest
+    env:
+      TAG: v1.1.2
+      WIN_ZIP: Smurfs2_GOG_Achievement_Repair_v1.1.2_Windows_x64.zip
+      SCRIPT_ZIP: Smurfs2_GOG_Achievement_Repair_v1.1.2_Script.zip
+      SOURCE_SHA256: d8c67c398e7930eac8d1075edc8b182499fa16be74b3ad14cbae7ef84f8c38fa
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.23.x'
+
+      - name: Restore exact v1.1.2 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat archive/v1.1.2/source.part.* | base64 -d | gzip -dc > Smurfs2_GOG_Achievement_Repair.go
+          echo "$SOURCE_SHA256  Smurfs2_GOG_Achievement_Repair.go" | sha256sum -c -
+
+      - name: Publish source to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Smurfs2_GOG_Achievement_Repair.go
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish Smurfs v1.1.2 source"
+            git push origin HEAD:main
+          fi
+          echo "RELEASE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build Windows x64
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w" \
+            -o Smurfs2_GOG_Achievement_Repair.exe \
+            Smurfs2_GOG_Achievement_Repair.go
+
+      - name: Package exact release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip -j "$WIN_ZIP" Smurfs2_GOG_Achievement_Repair.exe README.md
+          zip -j "$SCRIPT_ZIP" Smurfs2_GOG_Achievement_Repair.go README.md
+          test "$(unzip -Z1 "$WIN_ZIP" | wc -l)" -eq 2
+          test "$(unzip -Z1 "$SCRIPT_ZIP" | wc -l)" -eq 2
+          sha256sum Smurfs2_GOG_Achievement_Repair.exe Smurfs2_GOG_Achievement_Repair.go "$WIN_ZIP" "$SCRIPT_ZIP" | tee release_hashes.txt
+
+      - name: Create release notes
+        shell: bash
+        run: |
+          {
+            echo '# The Smurfs 2 - GOG Achievement Repair v1.1.2'
+            echo
+            echo '- English-only console UI.'
+            echo '- Per-slot Story / Epic / Challenge difficulty helper.'
+            echo '- Backup and post-write save validation for difficulty edits.'
+            echo '- GOG achievement writes still require VERIFIED evidence or explicit manual INFO confirmation.'
+            echo '- Server re-check after every achievement write.'
+            echo
+            echo '### Assets'
+            echo
+            echo '- **Windows x64**: EXE + README'
+            echo '- **Script**: Go source + README'
+            echo
+            echo '### SHA-256'
+            echo
+            echo '~~~text'
+            cat release_hashes.txt
+            echo '~~~'
+          } > release_notes.md
+
+      - name: Publish GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$WIN_ZIP" "$SCRIPT_ZIP" --clobber
+            gh release edit "$TAG" \
+              --title "Smurfs 2 GOG Achievement Repair v1.1.2" \
+              --notes-file release_notes.md
+          else
+            gh release create "$TAG" "$WIN_ZIP" "$SCRIPT_ZIP" \
+              --target "$RELEASE_SHA" \
+              --title "Smurfs 2 GOG Achievement Repair v1.1.2" \
+              --notes-file release_notes.md
+          fi
